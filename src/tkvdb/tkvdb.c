@@ -73,20 +73,6 @@ do {                                                                   \
 	}                                                              \
 } while (0)
 
-/* add trigger to corresponding set */
-#define TKVDB_TRIGGERS_ADD(T, F, TYPE, FTYPE)                          \
-do {                                                                   \
-	FTYPE *funcs;                                                  \
-	if (!F) { break; }                                             \
-	funcs = realloc(T->funcs_ ## TYPE,                             \
-		(T->n_ ## TYPE + 1) * sizeof(FTYPE));                  \
-	if (!funcs) {                                                  \
-		return 0;                                              \
-	}                                                              \
-	T->funcs_ ## TYPE = funcs;                                     \
-	T->funcs_ ## TYPE[T->n_ ## TYPE] = F;                          \
-	T->n_ ## TYPE ++;                                              \
-} while (0)
 
 struct tkvdb_params
 {
@@ -229,21 +215,25 @@ typedef struct tkvdb_cursor_data
 } tkvdb_cursor_data;
 
 
-/* triggers set */
+/* triggers */
+struct tkvdb_trigger_func_info
+{
+	tkvdb_trigger_func func;
+	size_t meta_size;
+	void *userdata;
+};
+
 struct tkvdb_triggers
 {
-	void *userdata;
+	size_t n_funcs;
+	struct tkvdb_trigger_func_info *funcs;
 
-	size_t n_before_insert;
-	tkvdb_trigger_func *funcs_before_insert;
-
-	size_t n_before_update;
-	tkvdb_trigger_func *funcs_before_update;
-
-	size_t n_meta_size;
-	tkvdb_trigger_size_func *funcs_meta_size;
+	/* sum of meta_size for each trigger */
+	size_t meta_size;
 
 	tkvdb_trigger_stack stack;
+
+	tkvdb_trigger_info info;
 };
 
 
@@ -564,6 +554,30 @@ tkvdb_cursor_valsize(tkvdb_cursor *c)
 	return cdata->val_size;
 }
 
+static tkvdb_datum
+tkvdb_cursor_key_datum(tkvdb_cursor *c)
+{
+	tkvdb_datum dat;
+	tkvdb_cursor_data *cdata = c->data;
+
+	dat.data = cdata->prefix;
+	dat.size = cdata->prefix_size;
+
+	return dat;
+}
+
+static tkvdb_datum
+tkvdb_cursor_val_datum(tkvdb_cursor *c)
+{
+	tkvdb_datum dat;
+	tkvdb_cursor_data *cdata = c->data;
+
+	dat.data = cdata->val;
+	dat.size = cdata->val_size;
+
+	return dat;
+}
+
 static int
 tkvdb_cursor_resize_prefix(tkvdb_cursor *c, size_t n, int grow)
 {
@@ -637,6 +651,7 @@ tkvdb_writebuf_realloc(tkvdb *db, size_t new_size)
 
 	return TKVDB_OK;
 }
+
 
 /* generated implementation of tkvdb_* functions () */
 #include "tkvdb_generated.inc"
@@ -775,7 +790,8 @@ tkvdb_tr_create(tkvdb *db, tkvdb_params *user_params)
 			tr->free = &tkvdb_tr_free_alignval;
 
 			tr->putx = &tkvdb_put_alignvalx;
-			tr->getx = &tkvdb_get_alignvalx;
+			tr->delx = &tkvdb_del_alignvalx;
+			tr->subnode = &tkvdb_subnode_alignval;
 		} else {
 			/* RAM-only */
 			tr->commit = &tkvdb_commit_alignval_nodb;
@@ -788,7 +804,8 @@ tkvdb_tr_create(tkvdb *db, tkvdb_params *user_params)
 			tr->free = &tkvdb_tr_free_alignval_nodb;
 
 			tr->putx = &tkvdb_put_alignval_nodbx;
-			tr->getx = &tkvdb_get_alignval_nodbx;
+			tr->delx = &tkvdb_del_alignval_nodbx;
+			tr->subnode = &tkvdb_subnode_alignval_nodb;
 		}
 	} else {
 		if (db) {
@@ -802,7 +819,8 @@ tkvdb_tr_create(tkvdb *db, tkvdb_params *user_params)
 			tr->free = &tkvdb_tr_free_generic;
 
 			tr->putx = &tkvdb_put_genericx;
-			tr->getx = &tkvdb_get_genericx;
+			tr->delx = &tkvdb_del_genericx;
+			tr->subnode = &tkvdb_subnode_generic;
 		} else {
 			tr->commit = &tkvdb_commit_generic_nodb;
 			tr->rollback = &tkvdb_rollback_generic_nodb;
@@ -814,7 +832,8 @@ tkvdb_tr_create(tkvdb *db, tkvdb_params *user_params)
 			tr->free = &tkvdb_tr_free_generic_nodb;
 
 			tr->putx = &tkvdb_put_generic_nodbx;
-			tr->getx = &tkvdb_get_generic_nodbx;
+			tr->delx = &tkvdb_del_generic_nodbx;
+			tr->subnode = &tkvdb_subnode_generic_nodb;
 		}
 	}
 
@@ -900,6 +919,9 @@ tkvdb_cursor_create(tkvdb_tr *tr)
 	c->val = &tkvdb_cursor_val;
 	c->valsize = &tkvdb_cursor_valsize;
 
+	c->key_datum = &tkvdb_cursor_key_datum;
+	c->val_datum = &tkvdb_cursor_val_datum;
+
 	c->free = &tkvdb_cursor_free;
 
 	if (trdata->params.alignval > 1) {
@@ -954,7 +976,7 @@ fail_calloc:
 
 /* triggers */
 tkvdb_triggers *
-tkvdb_triggers_create(size_t stack_size, void *userdata)
+tkvdb_triggers_create(size_t stack_limit)
 {
 	tkvdb_triggers *triggers;
 
@@ -962,59 +984,52 @@ tkvdb_triggers_create(size_t stack_size, void *userdata)
 	if (!triggers) {
 		return NULL;
 	}
+	memset(triggers, 0, sizeof(tkvdb_triggers));
 
 	/* FIXME: add dynamic allocation */
-	triggers->stack.valmeta = malloc(stack_size * sizeof(struct valmeta));
-	if (!triggers->stack.valmeta) {
+	triggers->stack.meta = malloc(stack_limit * sizeof(void *));
+	if (!triggers->stack.meta) {
 		free(triggers);
 		return NULL;
 	}
-	triggers->stack.size = stack_size;
+	triggers->stack.limit = stack_limit;
 
-	triggers->userdata = userdata;
-
-	triggers->n_before_insert = 0;
-	triggers->funcs_before_insert = NULL;
-
-	triggers->n_before_update = 0;
-	triggers->funcs_before_update = NULL;
-
-	triggers->n_meta_size = 0;
-	triggers->funcs_meta_size = NULL;
+	triggers->info.stack = &(triggers->stack);
 
 	return triggers;
 }
 
-int
-tkvdb_triggers_add_set(tkvdb_triggers *triggers,
-	const tkvdb_trigger_set *trigger_set)
+TKVDB_RES
+tkvdb_triggers_add(tkvdb_triggers *triggers, tkvdb_trigger_func func,
+	size_t meta_size, void *userdata)
 {
-	TKVDB_TRIGGERS_ADD(triggers, trigger_set->before_insert,
-		before_insert, tkvdb_trigger_func);
-	TKVDB_TRIGGERS_ADD(triggers, trigger_set->before_update,
-		before_update, tkvdb_trigger_func);
-	TKVDB_TRIGGERS_ADD(triggers, trigger_set->meta_size,
-		meta_size, tkvdb_trigger_size_func);
-	return 1;
+	struct tkvdb_trigger_func_info *funcs;
+
+	funcs = realloc(triggers->funcs, (triggers->n_funcs + 1)
+		* sizeof(struct tkvdb_trigger_func_info));
+	if (!funcs) {
+		return TKVDB_ENOMEM;
+	}
+
+	funcs[triggers->n_funcs].func = func;
+	funcs[triggers->n_funcs].userdata = userdata;
+	funcs[triggers->n_funcs].meta_size = meta_size;
+
+	triggers->funcs = funcs;
+	triggers->n_funcs++;
+	triggers->meta_size += meta_size;
+
+	return TKVDB_OK;
 }
 
 void
 tkvdb_triggers_free(tkvdb_triggers *triggers)
 {
-	if (triggers) {
-		free(triggers->funcs_before_insert);
-		triggers->funcs_before_insert = NULL;
-		triggers->n_before_insert = 0;
+	free(triggers->funcs);
+	free(triggers->stack.meta);
 
-		free(triggers->funcs_before_update);
-		triggers->funcs_before_update = NULL;
-		triggers->n_before_update = 0;
+	memset(triggers, 0, sizeof(tkvdb_triggers));
 
-		free(triggers->funcs_meta_size);
-		triggers->funcs_meta_size = NULL;
-		triggers->n_meta_size = 0;
-	}
-	free(triggers->stack.valmeta);
 	free(triggers);
 }
 

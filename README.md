@@ -9,4 +9,4 @@ A permissive license lets people do anything with your code with proper attribut
 
 Download: `https://github.com/vmxdev/tkvdb`
 
-Version: Commits on Oct 20, 2019, Fix triggers stack allocation and metadata propagation
+Version: Commits on Dec 9, 2020, Add cursor->key_datum()/val_datum()

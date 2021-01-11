@@ -91,14 +91,12 @@ TKVDB_IMPL_NODE_NEW(tkvdb_tr *tr, int type, size_t prefix_size,
 
 #define COPY_VAL(NODE)                                                     \
 do {                                                                       \
-	NODE->c.val_pad = VALPADDING(NODE);                                \
 	memcpy(NODE->prefix_val_meta + prefix_size + NODE->c.val_pad,      \
 		val, val_size);                                            \
 } while(0)
 
 #define COPY_META(NODE)                                                    \
 do {                                                                       \
-	NODE->c.val_pad = VALPADDING(NODE);                                \
 	memcpy(NODE->prefix_val_meta + prefix_size + NODE->c.val_pad       \
 		+ val_size, meta, meta_size);                              \
 } while(0)
@@ -154,6 +152,10 @@ do {                                                                       \
 			memcpy(node_leaf->prefix_val_meta,
 				prefix, prefix_size);
 		}
+
+#ifdef TKVDB_PARAMS_ALIGN_VAL
+		node_leaf->c.val_pad = VALPADDING(node_leaf);
+#endif
 		if (val_size > 0) {
 			COPY_VAL(node_leaf);
 		}
@@ -166,6 +168,10 @@ do {                                                                       \
 			memcpy(node->prefix_val_meta,
 				prefix, prefix_size);
 		}
+
+#ifdef TKVDB_PARAMS_ALIGN_VAL
+		node->c.val_pad = VALPADDING(node);
+#endif
 		if (val_size > 0) {
 			COPY_VAL(node);
 		}
@@ -191,6 +197,10 @@ do {                                                                       \
 static void
 TKVDB_IMPL_CLONE_SUBNODES(TKVDB_MEMNODE_TYPE *dst, TKVDB_MEMNODE_TYPE *src)
 {
+	if (dst->c.type & TKVDB_NODE_LEAF) {
+		/* dst has no subnodes, nothing to do */
+		return;
+	}
 	if (src->c.type & TKVDB_NODE_LEAF) {
 		memset(dst->next, 0, sizeof(void *) * 256);
 #ifndef TKVDB_PARAMS_NODBFILE
@@ -364,8 +374,12 @@ TKVDB_IMPL_NODE_READ(tkvdb_tr *trns,
 			memcpy(prefix_val_meta, ptr, blk_tail);
 
 			/* read rest of prefix */
-			read(fd, prefix_val_meta + blk_tail,
-				pfx_size - blk_tail);
+			if (!tkvdb_try_read_file(fd,
+				prefix_val_meta + blk_tail,
+				pfx_size - blk_tail, 0)) {
+
+				return TKVDB_IO_ERROR;
+			}
 
 			/* read value + metadata */
 			(*node_ptr)->c.val_pad = VALPADDING((*node_ptr));

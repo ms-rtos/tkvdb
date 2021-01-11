@@ -39,7 +39,7 @@ LOCAL_SRCS := \
 # Header file search path (eg. LOCAL_INC_PATH := -I"Your hearder files search path")
 #*********************************************************************************************************
 LOCAL_INC_PATH := \
--I"./src/uffs/src/inc"
+-I"./src/tkvdb"
 
 #*********************************************************************************************************
 # Pre-defined macro (eg. -DYOUR_MARCO=1)

@@ -52,31 +52,46 @@ static void
 gen_rand(void)
 {
 	size_t i, j;
+	unsigned int seed = 0;
+
+	seed = time(NULL);
+	srand(seed);
+
+	fprintf(stderr, "Generating random data with seed %u ... ", seed);
 
 	for (i=0; i<N; i++) {
 		struct kv datum;
 
+		memset(&datum, 0, sizeof(struct kv));
+
 		for (;;) {
 			size_t nmemb = i;
+
+			memset(datum.key, 0, KLEN);
+
 			datum.klen = rand() % (KLEN - 1) + 1;
 			for (j=0; j<datum.klen; j++) {
 				datum.key[j] = rand();
 			}
-			if (lfind(&datum, &kvs_unsorted, &nmemb, sizeof(struct kv), &keycmp) == NULL) {
+			if (lfind(&datum, &kvs_unsorted, &nmemb,
+				sizeof(struct kv), &keycmp) == NULL) {
+
 				break;
 			}
 		}
-
 		datum.vlen = rand() % (VLEN - 1) + 1;
 		for (j=0; j<datum.vlen; j++) {
 			datum.val[j] = rand();
 		}
+
 		kvs_unsorted[i] = datum;
 	}
 
 	memcpy(&kvs, &kvs_unsorted, sizeof(struct kv) * N);
 	/* sort generated data */
 	qsort(&kvs, N, sizeof(struct kv), &keycmp);
+
+	fprintf(stderr, "done\n");
 }
 
 static void
@@ -640,88 +655,371 @@ struct basic_trigger_data
 
 
 static TKVDB_RES
-basic_trigger_update(tkvdb_tr *tr,
-	const tkvdb_datum *key, const tkvdb_trigger_stack *s, void *userdata)
+trigger_basic(tkvdb_trigger_info *info)
 {
-	(void)tr;
-	(void)key;
-	(void)s;
+	struct basic_trigger_data *data = info->userdata;
 
-	struct basic_trigger_data *data = userdata;
+	switch (info->type) {
+		case TKVDB_TRIGGER_UPDATE:
+			data->updates++;
+			break;
 
-	data->updates++;
+		case TKVDB_TRIGGER_INSERT_NEWROOT:
+		case TKVDB_TRIGGER_INSERT_NEWNODE:
+		case TKVDB_TRIGGER_INSERT_SUBKEY:
+		case TKVDB_TRIGGER_INSERT_SHORTER:
+		case TKVDB_TRIGGER_INSERT_LONGER:
+		case TKVDB_TRIGGER_INSERT_SPLIT:
+			data->inserts++;
+			break;
+			break;
+
+		default:
+			break;
+	}
 
 	return TKVDB_OK;
-}
-
-static TKVDB_RES
-basic_trigger_insert(tkvdb_tr *tr,
-	const tkvdb_datum *key, const tkvdb_trigger_stack *s, void *userdata)
-{
-	(void)tr;
-	(void)key;
-	(void)s;
-
-	struct basic_trigger_data *data = userdata;
-
-	data->inserts++;
-
-	return TKVDB_OK;
-}
-
-static size_t
-basic_trigger_meta_size(const tkvdb_datum *key, const tkvdb_datum *val,
-	void *userdata)
-{
-	(void)key;
-	(void)val;
-	(void)userdata;
-
-	return sizeof(uint64_t);
 }
 
 void
 test_triggers_basic(void)
 {
 	tkvdb_tr *tr;
-	int i, r;
-	char strkey[20];
+	int i;
 	tkvdb_triggers *trg;
-	struct basic_trigger_data userdata;
-	tkvdb_trigger_set trigger_set;
+	struct basic_trigger_data userdata1, userdata2, userdata3;
+	TKVDB_RES r;
 
-	userdata.inserts = userdata.updates = 0;
+	userdata1.inserts = userdata1.updates = 0;
+	userdata2.inserts = userdata2.updates = 0;
+	userdata3.inserts = userdata3.updates = 0;
 
 	tr = tkvdb_tr_create(NULL, NULL);
 	TEST_CHECK(tr != NULL);
 
-	trg = tkvdb_triggers_create(128, &userdata);
+	trg = tkvdb_triggers_create(128);
 	TEST_CHECK(trg != NULL);
 
-	trigger_set.before_update = basic_trigger_update;
-	trigger_set.before_insert = basic_trigger_insert;
-	trigger_set.meta_size = basic_trigger_meta_size;
+	r = tkvdb_triggers_add(trg, &trigger_basic, sizeof(uint64_t),
+		&userdata1);
+	TEST_CHECK(r == TKVDB_OK);
 
-	r = tkvdb_triggers_add_set(trg, &trigger_set);
-	TEST_CHECK(r != 0);
+	r = tkvdb_triggers_add(trg, &trigger_basic, sizeof(uint64_t),
+		&userdata2);
+	TEST_CHECK(r == TKVDB_OK);
+
+	r = tkvdb_triggers_add(trg, &trigger_basic, sizeof(uint64_t),
+		&userdata3);
+	TEST_CHECK(r == TKVDB_OK);
 
 	TEST_CHECK(tr->begin(tr) == TKVDB_OK);
 	for (i=0; i<N; i++) {
 		tkvdb_datum key, val;
 
+		key.data = kvs_unsorted[i].key;
+		key.size = kvs_unsorted[i].klen;
+		val.data = kvs_unsorted[i].val;
+		val.size = kvs_unsorted[i].vlen;
+
 		/* 1 insert and 2 updates for each key */
-		snprintf(strkey, sizeof(strkey), "%d", i / 3);
-		key.data = strkey;
-		key.size = strlen(strkey);
-		val.data = &i;
-		val.size = sizeof(int);
+		TEST_CHECK(tr->putx(tr, &key, &val, trg) == TKVDB_OK);
+
+		TEST_CHECK(tr->putx(tr, &key, &val, trg) == TKVDB_OK);
 		TEST_CHECK(tr->putx(tr, &key, &val, trg) == TKVDB_OK);
 	}
 	TEST_CHECK(tr->rollback(tr) == TKVDB_OK);
 	tr->free(tr);
 	tkvdb_triggers_free(trg);
 
-	TEST_CHECK(userdata.inserts + userdata.updates == N);
+	TEST_CHECK(userdata1.inserts + userdata1.updates == (N + N * 2));
+	TEST_CHECK(userdata2.inserts + userdata2.updates == (N + N * 2));
+	TEST_CHECK(userdata3.inserts + userdata3.updates == (N + N * 2));
+	TEST_CHECK(userdata1.inserts == userdata2.inserts);
+	TEST_CHECK(userdata2.inserts == userdata3.inserts);
+}
+
+
+static TKVDB_RES
+trigger_nth(tkvdb_trigger_info *info)
+{
+	size_t i;
+
+	switch (info->type) {
+		case TKVDB_TRIGGER_UPDATE:
+			break;
+		case TKVDB_TRIGGER_INSERT_NEWROOT:
+			*((uint64_t *)info->newroot) = 1;
+
+			break;
+		case TKVDB_TRIGGER_INSERT_NEWNODE:
+			*((uint64_t *)info->subnode1) = 1;
+
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) += 1;
+			}
+
+			break;
+		case TKVDB_TRIGGER_INSERT_SUBKEY:
+			*((uint64_t *)info->newroot) += 1;
+
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) += 1;
+			}
+
+			break;
+		case TKVDB_TRIGGER_INSERT_SHORTER:
+			*((uint64_t *)info->newroot) =
+			*((uint64_t *)info->subnode1) + 1;
+
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) += 1;
+			}
+
+			break;
+		case TKVDB_TRIGGER_INSERT_LONGER:
+			*((uint64_t *)info->newroot) += 1;
+			*((uint64_t *)info->subnode1) = 1;
+
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) += 1;
+			}
+
+			break;
+		case TKVDB_TRIGGER_INSERT_SPLIT:
+			*((uint64_t *)info->newroot) =
+				*((uint64_t *)info->subnode1) + 1;
+			*((uint64_t *)info->subnode2) = 1;
+
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) += 1;
+			}
+
+			break;
+
+		case TKVDB_TRIGGER_DELETE_ROOT:
+			break;
+
+		case TKVDB_TRIGGER_DELETE_PREFIX:
+			break;
+
+		case TKVDB_TRIGGER_DELETE_LEAF:
+			for (i=0; i<(info->stack->size - 1); i++) {
+				*((uint64_t *)info->stack->meta[i]) -= 1;
+			}
+			break;
+
+		case TKVDB_TRIGGER_DELETE_INTNODE:
+			for (i=0; i<info->stack->size; i++) {
+				*((uint64_t *)info->stack->meta[i]) -= 1;
+			}
+			break;
+
+		default:
+			break;
+	}
+
+	return TKVDB_OK;
+}
+
+#define TKVDB_TRG_GET_NTH_REALLOC_KEY(K, LEN, A)                      \
+do {                                                                  \
+	if (A < (K->size + LEN)) {                                    \
+		void *tmp = realloc(K->data, K->size + LEN);          \
+		if (!tmp) {                                           \
+			return TKVDB_ENOMEM;                          \
+		}                                                     \
+		K->data = tmp;                                        \
+		A = K->size + LEN;                                    \
+	}                                                             \
+} while (0)
+
+static TKVDB_RES
+tkvdb_get_nth(tkvdb_tr *tr, uint64_t n, tkvdb_datum *key, tkvdb_datum *val,
+		tkvdb_datum *prealloc)
+{
+	tkvdb_datum pfx, meta;
+	void *node, *subnode;
+	uint64_t s = 0;
+	TKVDB_RES r;
+	int i, prev_i = 0;
+	uint64_t nmeta;
+	size_t allocated;
+
+	if (prealloc) {
+		allocated = prealloc->size;
+		key->data = prealloc->data;
+	} else {
+		allocated = 0;
+		key->data = NULL;
+	}
+	key->size = 0;
+
+	/* get root node */
+	r = tr->subnode(tr, NULL, 0, &node, &pfx, val, &meta);
+	if (r != TKVDB_OK) {
+		return r;
+	}
+	nmeta = *((uint64_t *)meta.data);
+
+	if ((n + 1) > nmeta) {
+		return TKVDB_NOT_FOUND;
+	}
+next:
+	/* append prefix to key */
+	TKVDB_TRG_GET_NTH_REALLOC_KEY(key, pfx.size, allocated);
+	memcpy((char *)(key->data) + key->size, pfx.data, pfx.size);
+	key->size += pfx.size;
+
+	if (val->data) {
+		s += 1;
+		if (s == (n + 1)) {
+			goto ok;
+		}
+	}
+
+	for (i=0; i<256; i++) {
+		r = tr->subnode(tr, node, i, &subnode, &pfx, val, &meta);
+		if (r != TKVDB_OK) {
+			continue;
+		}
+
+		nmeta = *((uint64_t *)meta.data);
+
+		prev_i = i;
+
+		if ((s + nmeta) == (n + 1)) {
+			TKVDB_TRG_GET_NTH_REALLOC_KEY(key, 1, allocated);
+			((char *)(key->data))[key->size] = i;
+			key->size += 1;
+
+			if (!val->data) {
+				/* non-val node */
+				node = subnode;
+				prev_i = i;
+				goto next;
+			} else {
+				if (nmeta > 1) {
+					node = subnode;
+					prev_i = i;
+					goto next;
+				}
+				/* append last prefix */
+				TKVDB_TRG_GET_NTH_REALLOC_KEY(key, pfx.size,
+					allocated);
+				memcpy((char *)(key->data) + key->size,
+					pfx.data, pfx.size);
+				key->size += pfx.size;
+
+				goto ok;
+			}
+		} else if ((s + nmeta) > (n + 1)) {
+			node = subnode;
+
+			TKVDB_TRG_GET_NTH_REALLOC_KEY(key, 1, allocated);
+			((char *)(key->data))[key->size] = i;
+			key->size += 1;
+
+			prev_i = i;
+			goto next;
+		}
+		s += nmeta;
+	}
+
+	if ((!val->data) || (val->data && (nmeta > 1))) {
+		TKVDB_TRG_GET_NTH_REALLOC_KEY(key, 1, allocated);
+		((char *)(key->data))[key->size] = prev_i;
+		key->size += 1;
+
+		s -= nmeta;
+		node = subnode;
+		goto next;
+	}
+ok:
+	if (prealloc) {
+		prealloc->size = allocated;
+		prealloc->data = key->data;
+	}
+	return TKVDB_OK;
+}
+#undef TKVDB_TRG_GET_NTH_REALLOC_KEY
+
+void
+test_triggers_nth(void)
+{
+	tkvdb_tr *tr;
+	int i;
+	tkvdb_triggers *trg;
+	TKVDB_RES r;
+
+	tr = tkvdb_tr_create(NULL, NULL);
+	TEST_CHECK(tr != NULL);
+
+	trg = tkvdb_triggers_create(128);
+	TEST_CHECK(trg != NULL);
+
+	r = tkvdb_triggers_add(trg, &trigger_nth, sizeof(uint64_t), NULL);
+	TEST_CHECK(r == TKVDB_OK);
+
+	TEST_CHECK(tr->begin(tr) == TKVDB_OK);
+	/* fill transaction with unsorted kv-pairs */
+	for (i=0; i<N; i++) {
+		tkvdb_datum key, val;
+
+		key.data = kvs_unsorted[i].key;
+		key.size = kvs_unsorted[i].klen;
+		val.data = kvs_unsorted[i].val;
+		val.size = kvs_unsorted[i].vlen;
+
+		TEST_CHECK(tr->putx(tr, &key, &val, trg) == TKVDB_OK);
+	}
+
+	/* get all pairs by number */
+	for (i=0; i<N; i++) {
+		tkvdb_datum key, val, prealloc;
+		char databuf[KLEN];
+
+		memset(databuf, 0, sizeof(databuf));
+		prealloc.size = sizeof(databuf);
+		prealloc.data = databuf;
+
+		r = tkvdb_get_nth(tr, i, &key, &val, &prealloc);
+
+		TEST_CHECK(val.size == kvs[i].vlen);
+		TEST_CHECK(key.size == kvs[i].klen);
+		TEST_CHECK(memcmp(key.data, kvs[i].key, key.size) == 0);
+		TEST_CHECK(memcmp(val.data, kvs[i].val, val.size) == 0);
+	}
+
+	/* remove each 2-nd key-value pair */
+	for (i=0; i<N/2; i++) {
+		tkvdb_datum key;
+
+		key.data = kvs[i * 2].key;
+		key.size = kvs[i * 2].klen;
+
+		TEST_CHECK(tr->delx(tr, &key, 0, trg) == TKVDB_OK);
+	}
+
+	for (i=0; i<N/2; i++) {
+		tkvdb_datum key, val, prealloc;
+		char databuf[KLEN];
+
+		memset(databuf, 0, sizeof(databuf));
+		prealloc.size = sizeof(databuf);
+		prealloc.data = databuf;
+
+		r = tkvdb_get_nth(tr, i, &key, &val, &prealloc);
+
+		TEST_CHECK(val.size == kvs[i * 2 + 1].vlen);
+		TEST_CHECK(key.size == kvs[i * 2 + 1].klen);
+		TEST_CHECK(memcmp(key.data, kvs[i * 2 + 1].key, key.size) == 0);
+		TEST_CHECK(memcmp(val.data, kvs[i * 2 + 1].val, val.size) == 0);
+	}
+
+
+	TEST_CHECK(tr->rollback(tr) == TKVDB_OK);
+	tr->free(tr);
+	tkvdb_triggers_free(trg);
 }
 
 #if 0
@@ -798,6 +1096,7 @@ TEST_LIST = {
 	{ "delete", test_del },
 	{ "ram-only memory usage", test_ram_mem },
 	{ "triggers basic", test_triggers_basic },
+	{ "triggers nth", test_triggers_nth },
 	/*{ "vacuum", test_vacuum },*/
 	{ 0 }
 };
